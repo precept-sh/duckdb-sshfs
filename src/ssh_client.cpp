@@ -225,7 +225,7 @@ void SSHClient::InitializeSession() {
   }
 
   // Set preferred host key algorithms
-  // When strict_crypto is enabled, removes ecdsa-sha2-nistp* and ssh-rsa
+  // When strict_crypto is enabled, removes ecdsa-sha2-nistp* and ssh-*
   const char *hostkey_algorithms;
   if (params.strict_crypto) {
     hostkey_algorithms = "ssh-ed25519,rsa-sha2-256,rsa-sha2-512";
@@ -233,7 +233,7 @@ void SSHClient::InitializeSession() {
     hostkey_algorithms = "ssh-ed25519,"
                          "ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,"
                          "ecdsa-sha2-nistp521,"
-                         "rsa-sha2-256,rsa-sha2-512,ssh-rsa";
+                         "rsa-sha2-256,rsa-sha2-512,ssh-rsa,ssh-dss";
   }
   int hk_rc = libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY,
                                           hostkey_algorithms);
