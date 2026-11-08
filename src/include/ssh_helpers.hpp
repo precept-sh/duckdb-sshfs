@@ -1,44 +1,47 @@
 #pragma once
 
 #include "duckdb/common/exception.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
+#include <sstream>
 #include <string>
 
 namespace duckdb {
 
-// Thread-local debug flag (set from sshfs_debug_logging setting)
-extern thread_local bool g_sshfs_debug_enabled;
+// Process-wide debug flag (set from sshfs_debug_logging setting). Visible to
+// every thread, including DuckDB workers and upload threads. The setting is
+// per-database but this flag is global: the most recent value read wins.
+extern std::atomic<bool> g_sshfs_debug_enabled;
 
 // Simple logging configuration
-// Checks both sshfs_debug_logging setting (via thread_local) and SSHFS_DEBUG
+// Checks both sshfs_debug_logging setting (via the global flag) and SSHFS_DEBUG
 // env var (for backward compatibility)
 inline bool IsDebugLoggingEnabled() {
-  // Check thread-local flag first (from setting)
-  if (g_sshfs_debug_enabled) {
+  if (g_sshfs_debug_enabled.load(std::memory_order_relaxed)) {
     return true;
   }
 
   // Fall back to environment variable for backward compatibility
-  static bool checked = false;
-  static bool enabled = false;
-
-  if (!checked) {
+  // (function-local static initialization is thread-safe)
+  static const bool env_enabled = []() {
     const char *env = std::getenv("SSHFS_DEBUG");
-    enabled = (env != nullptr && std::string(env) == "1");
-    checked = true;
-  }
+    return env != nullptr && std::string(env) == "1";
+  }();
 
-  return enabled;
+  return env_enabled;
 }
 
 #define SSHFS_LOG(msg)                                                         \
   do {                                                                         \
     if (IsDebugLoggingEnabled()) {                                             \
-      std::cerr << msg << std::endl;                                           \
+      /* Format first, write once, so lines from threads do not interleave */  \
+      std::ostringstream sshfs_log_stream;                                     \
+      sshfs_log_stream << msg << '\n';                                         \
+      std::cerr << sshfs_log_stream.str() << std::flush;                       \
     }                                                                          \
   } while (0)
 
