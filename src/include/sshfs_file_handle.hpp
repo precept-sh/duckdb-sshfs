@@ -69,11 +69,6 @@ private:
   size_t chunk_size = 50 * 1024 * 1024; // 50MB default
   size_t chunk_count = 0;
 
-  // Read handle caching - keep SFTP session open across reads
-  LIBSSH2_SFTP *read_sftp = nullptr;
-  LIBSSH2_SFTP_HANDLE *read_handle = nullptr;
-  bool read_initialized = false;
-
   // File stats caching - avoid repeated SFTP stat calls
   LIBSSH2_SFTP_ATTRIBUTES cached_file_stats;
   bool stats_cached = false;
@@ -93,8 +88,6 @@ private:
       0; // Total bytes written by DuckDB (for progress)
 
   void FlushChunk();
-  void OpenForRead();     // Lazily open SFTP and file handle
-  void CloseReadHandle(); // Close read handle
 
   // Streaming upload methods
   void UploadChunkAsync(std::shared_ptr<SSHFSWriteBuffer> buffer);

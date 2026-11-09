@@ -16,8 +16,10 @@
 
 namespace duckdb {
 
-// Thread-local debug flag
-thread_local bool g_sshfs_debug_enabled = false;
+// Process-wide debug flag (set from the sshfs_debug_logging setting). Atomic
+// rather than thread_local: file operations run on DuckDB worker threads and
+// our own upload threads, and the setting is only seen on the calling thread.
+std::atomic<bool> g_sshfs_debug_enabled{false};
 
 // Global mutex to serialize dd command execution (SSH channels)
 // Hetzner Storage Boxes limit concurrent SSH channels
@@ -25,8 +27,6 @@ thread_local bool g_sshfs_debug_enabled = false;
 static std::mutex g_dd_command_mutex;
 
 SSHClient::SSHClient(const SSHConnectionParams &params) : params(params) {
-  // Set thread-local debug flag from params
-  g_sshfs_debug_enabled = params.debug_logging;
   // Initialize libssh2 (refcounted internally, safe to call multiple times)
   int rc = libssh2_init(0);
   if (rc != 0) {
@@ -39,7 +39,20 @@ SSHClient::~SSHClient() {
   libssh2_exit();
 }
 
+std::unique_lock<std::recursive_mutex> SSHClient::LockConnected() {
+  auto lock = LockSession();
+  Connect(); // no-op when already connected
+  return lock;
+}
+
 void SSHClient::Connect() {
+  // Serialize connects, and re-check under the lock: another thread may have
+  // connected while we waited.
+  auto lock = LockSession();
+  if (connected) {
+    return;
+  }
+
   // Detect Hetzner Storage Boxes and disable dd upfront
   // Hetzner has very strict SSH channel limits that make dd unusable for large
   // queries
@@ -47,10 +60,6 @@ void SSHClient::Connect() {
       params.hostname.find("your-storagebox.de") != std::string::npos) {
     SSHFS_LOG("  [DETECT] Detected Hetzner Storage Box - disabling dd reads");
     dd_disabled = true;
-  }
-
-  if (connected) {
-    return;
   }
 
   int retry_delay_ms = params.initial_retry_delay_ms;
@@ -536,6 +545,7 @@ void SSHClient::Authenticate() {
 }
 
 void SSHClient::Disconnect() {
+  auto lock = LockSession();
   if (!connected) {
     return;
   }
@@ -546,6 +556,13 @@ void SSHClient::Disconnect() {
 }
 
 bool SSHClient::ValidateConnection() {
+  // Never queue behind a long read just to probe liveness: a busy session is
+  // in use, and its user will notice if it is dead.
+  auto lock = std::unique_lock<std::recursive_mutex>(session_mutex,
+                                                     std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return true;
+  }
   if (!connected || !session) {
     return false;
   }
@@ -571,14 +588,7 @@ void SSHClient::CleanupSession() {
 }
 
 std::string SSHClient::ExecuteCommand(const std::string &command) {
-  if (!connected) {
-    throw IOException(
-        "Not connected to SSH server\n"
-        "  → Connection may have been closed or timed out\n"
-        "  → Try reconnecting or check keepalive_interval setting\n"
-        "  → Check: ssh -p %d %s@%s",
-        params.port, params.username.c_str(), params.hostname.c_str());
-  }
+  auto lock = LockConnected();
 
   // Open channel
   LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
@@ -636,18 +646,11 @@ std::string SSHClient::ExecuteCommand(const std::string &command) {
 
 void SSHClient::UploadChunk(const std::string &remote_path, const char *data,
                             size_t size, bool append) {
-  if (!connected) {
-    throw IOException("Not connected to SSH server");
-  }
-
   ScopedTimer total_timer("SFTP", append ? "Append data" : "Total upload");
 
-  // Lock per-client mutex to serialize SFTP operations (libssh2 session is not
-  // thread-safe)
-  std::lock_guard<std::mutex> lock(upload_mutex);
-
-  // Borrow SFTP session from pool
-  LIBSSH2_SFTP *sftp = BorrowSFTPSession();
+  // Holds the session lock and the pooled SFTP channel for the whole upload
+  SFTPLease lease(*this);
+  LIBSSH2_SFTP *sftp = lease.Get();
 
   // Create parent directories if needed
   {
@@ -705,7 +708,6 @@ void SSHClient::UploadChunk(const std::string &remote_path, const char *data,
                               LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
 
     if (!sftp_handle) {
-      ReturnSFTPSession(sftp);
       throw IOException("Failed to open remote file for %s: %s",
                         append ? "appending" : "writing", remote_path);
     }
@@ -725,7 +727,6 @@ void SSHClient::UploadChunk(const std::string &remote_path, const char *data,
         char *err_msg;
         libssh2_session_last_error(session, &err_msg, nullptr, 0);
         libssh2_sftp_close(sftp_handle);
-        ReturnSFTPSession(sftp);
         throw IOException(
             "Failed to write to remote file: %s (libssh2 error %d: %s)",
             remote_path, (int)written, err_msg ? err_msg : "Unknown error");
@@ -734,7 +735,6 @@ void SSHClient::UploadChunk(const std::string &remote_path, const char *data,
       if (written == 0) {
         // No progress - this shouldn't happen in blocking mode
         libssh2_sftp_close(sftp_handle);
-        ReturnSFTPSession(sftp);
         throw IOException("SFTP write stalled at %zu/%zu bytes for: %s",
                           total_written, size, remote_path);
       }
@@ -743,23 +743,15 @@ void SSHClient::UploadChunk(const std::string &remote_path, const char *data,
     }
   }
 
-  // Close file and return SFTP session to pool
+  // Close file; the lease returns the SFTP channel to the pool
   {
     ScopedTimer close_timer("SFTP", "Close handle");
     libssh2_sftp_close(sftp_handle);
   }
-
-  // Return SFTP session to pool for reuse
-  ReturnSFTPSession(sftp);
 }
 
 void SSHClient::RemoveFile(const std::string &remote_path) {
-  if (!connected) {
-    throw IOException(
-        "Not connected to SSH server\n"
-        "  → Connection may have been closed or timed out\n"
-        "  → Try reconnecting or check keepalive_interval setting");
-  }
+  auto lock = LockConnected();
 
   // Use SFTP exclusively (avoids command injection via remote_path)
   LIBSSH2_SFTP *sftp = libssh2_sftp_init(session);
@@ -785,12 +777,7 @@ void SSHClient::RemoveFile(const std::string &remote_path) {
 
 void SSHClient::RenameFile(const std::string &source_path,
                            const std::string &target_path) {
-  if (!connected) {
-    throw IOException(
-        "Not connected to SSH server\n"
-        "  → Connection may have been closed or timed out\n"
-        "  → Try reconnecting or check keepalive_interval setting");
-  }
+  auto lock = LockConnected();
 
   // Use SFTP exclusively (avoids command injection via paths)
   LIBSSH2_SFTP *sftp = libssh2_sftp_init(session);
@@ -812,10 +799,11 @@ void SSHClient::RenameFile(const std::string &source_path,
       sftp, source_path.c_str(), source_path.length(), target_path.c_str(),
       target_path.length(),
       LIBSSH2_SFTP_RENAME_OVERWRITE | LIBSSH2_SFTP_RENAME_ATOMIC);
+  // Read the error before shutdown frees the SFTP channel
+  unsigned long sftp_error = rc != 0 ? libssh2_sftp_last_error(sftp) : 0;
   libssh2_sftp_shutdown(sftp);
 
   if (rc != 0) {
-    unsigned long sftp_error = libssh2_sftp_last_error(sftp);
     throw IOException("Failed to rename remote file from %s to %s\n"
                       "  → SFTP error code: %lu\n"
                       "  → Source may not exist or target may already exist\n"
@@ -826,17 +814,11 @@ void SSHClient::RenameFile(const std::string &source_path,
 
 LIBSSH2_SFTP_ATTRIBUTES
 SSHClient::GetFileStats(const std::string &remote_path) {
-  if (!connected) {
-    throw IOException(
-        "Not connected to SSH server\n"
-        "  → Connection may have been closed or timed out\n"
-        "  → Try reconnecting or check keepalive_interval setting");
-  }
-
   auto stats_start = std::chrono::steady_clock::now();
 
-  // Use pooled SFTP session instead of creating new one each time
-  LIBSSH2_SFTP *sftp = BorrowSFTPSession();
+  // Pooled SFTP channel; the lease holds the session lock for the whole stat
+  SFTPLease lease(*this);
+  LIBSSH2_SFTP *sftp = lease.Get();
 
   // Get file stats
   auto stat_start = std::chrono::steady_clock::now();
@@ -848,7 +830,6 @@ SSHClient::GetFileStats(const std::string &remote_path) {
 
   if (rc != 0) {
     unsigned long sftp_error = libssh2_sftp_last_error(sftp);
-    ReturnSFTPSession(sftp);
     throw IOException("Failed to get file stats for: %s\n"
                       "  → SFTP error code: %lu\n"
                       "  → File may not exist or you may lack permissions\n"
@@ -857,9 +838,6 @@ SSHClient::GetFileStats(const std::string &remote_path) {
                       params.username.c_str(), params.hostname.c_str(),
                       remote_path.c_str());
   }
-
-  // Return session to pool
-  ReturnSFTPSession(sftp);
 
   auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - stats_start)
@@ -876,10 +854,6 @@ SSHClient::GetFileStats(const std::string &remote_path) {
 
 size_t SSHClient::ReadBytes(const std::string &remote_path, char *buffer,
                             size_t offset, size_t length) {
-  if (!connected) {
-    throw IOException("Not connected to SSH server");
-  }
-
   // Fall back to SFTP reads for SFTP-only servers or if dd has been disabled
   if (!supports_commands || dd_disabled) {
     return ReadBytesSFTP(remote_path, buffer, offset, length);
@@ -887,7 +861,9 @@ size_t SSHClient::ReadBytes(const std::string &remote_path, char *buffer,
 
   // Serialize dd command execution globally to avoid overwhelming Hetzner's SSH
   // channel limits
+  // Lock order: g_dd_command_mutex, then the session lock
   std::lock_guard<std::mutex> dd_lock(g_dd_command_mutex);
+  auto session_lock = LockConnected();
 
   auto read_start = std::chrono::steady_clock::now();
 
@@ -1003,6 +979,8 @@ size_t SSHClient::ReadBytes(const std::string &remote_path, char *buffer,
 }
 
 void SSHClient::InitializeSFTPPool() {
+  // Caller holds pool_mutex (and the session lock), so concurrent callers can
+  // never each open channels and push the pool past pool_size.
   if (pool_initialized) {
     return;
   }
@@ -1018,7 +996,7 @@ void SSHClient::InitializeSFTPPool() {
     LIBSSH2_SFTP *sftp = libssh2_sftp_init(session);
     if (!sftp) {
       // Clean up any sessions we already created
-      CleanupSFTPPool();
+      CleanupSFTPPoolLocked();
       throw IOException("Failed to initialize SFTP session for pool");
     }
     sftp_pool.push(sftp);
@@ -1039,7 +1017,10 @@ void SSHClient::InitializeSFTPPool() {
 
 void SSHClient::CleanupSFTPPool() {
   std::lock_guard<std::mutex> lock(pool_mutex);
+  CleanupSFTPPoolLocked();
+}
 
+void SSHClient::CleanupSFTPPoolLocked() {
   while (!sftp_pool.empty()) {
     LIBSSH2_SFTP *sftp = sftp_pool.front();
     sftp_pool.pop();
@@ -1050,6 +1031,9 @@ void SSHClient::CleanupSFTPPool() {
 }
 
 LIBSSH2_SFTP *SSHClient::BorrowSFTPSession() {
+  // Callers hold the session lock via SFTPLease; taking it here as well keeps
+  // pool init (which opens a channel) safe even if that ever changes.
+  auto session_lock = LockConnected();
   std::unique_lock<std::mutex> lock(pool_mutex);
 
   SSHFS_LOG("  [POOL] BorrowSFTPSession called, pool has " << sftp_pool.size()
@@ -1057,9 +1041,7 @@ LIBSSH2_SFTP *SSHClient::BorrowSFTPSession() {
 
   // Lazy pool initialization on first use
   if (!pool_initialized) {
-    lock.unlock();
     InitializeSFTPPool();
-    lock.lock();
   }
 
   // Wait for an available session from the pool
@@ -1153,11 +1135,11 @@ void SSHClient::DetectCapabilities() {
 void SSHClient::CreateDirectorySFTP(const std::string &remote_path) {
   // Recursively create directories using SFTP mkdir
   // Split path by '/' and create each directory level
-  // Note: Called from UploadChunk which already holds upload_mutex
 
-  LIBSSH2_SFTP *sftp = BorrowSFTPSession();
+  SFTPLease lease(*this);
+  LIBSSH2_SFTP *sftp = lease.Get();
 
-  try {
+  {
     std::string path;
     size_t pos = 0;
     size_t start = 0;
@@ -1192,7 +1174,6 @@ void SSHClient::CreateDirectorySFTP(const std::string &remote_path) {
           unsigned long err_code = libssh2_sftp_last_error(sftp);
           // Ignore "file exists" errors
           if (err_code != LIBSSH2_FX_FILE_ALREADY_EXISTS) {
-            ReturnSFTPSession(sftp);
             throw IOException(
                 "Failed to create directory: %s (SFTP error: %lu)", path,
                 err_code);
@@ -1212,62 +1193,46 @@ void SSHClient::CreateDirectorySFTP(const std::string &remote_path) {
       }
     }
 
-    ReturnSFTPSession(sftp);
-  } catch (...) {
-    ReturnSFTPSession(sftp);
-    throw;
   }
 }
 
 void SSHClient::RemoveDirectorySFTP(const std::string &remote_path) {
-  LIBSSH2_SFTP *sftp = BorrowSFTPSession();
+  SFTPLease lease(*this);
+  LIBSSH2_SFTP *sftp = lease.Get();
 
-  try {
-    int rc = libssh2_sftp_rmdir(sftp, remote_path.c_str());
-    ReturnSFTPSession(sftp);
-
-    if (rc != 0) {
-      unsigned long err_code = libssh2_sftp_last_error(sftp);
-      throw IOException("Failed to remove directory: %s (SFTP error: %lu)",
-                        remote_path, err_code);
-    }
-  } catch (...) {
-    ReturnSFTPSession(sftp);
-    throw;
+  int rc = libssh2_sftp_rmdir(sftp, remote_path.c_str());
+  if (rc != 0) {
+    unsigned long err_code = libssh2_sftp_last_error(sftp);
+    throw IOException("Failed to remove directory: %s (SFTP error: %lu)",
+                      remote_path, err_code);
   }
 }
 
 void SSHClient::TruncateFileSFTP(const std::string &remote_path,
                                  int64_t new_size) {
-  LIBSSH2_SFTP *sftp = BorrowSFTPSession();
+  SFTPLease lease(*this);
+  LIBSSH2_SFTP *sftp = lease.Get();
 
-  try {
-    // Open file for writing
-    LIBSSH2_SFTP_HANDLE *handle =
-        libssh2_sftp_open(sftp, remote_path.c_str(), LIBSSH2_FXF_WRITE, 0);
+  // Open file for writing
+  LIBSSH2_SFTP_HANDLE *handle =
+      libssh2_sftp_open(sftp, remote_path.c_str(), LIBSSH2_FXF_WRITE, 0);
 
-    if (!handle) {
-      ReturnSFTPSession(sftp);
-      throw IOException("Failed to open file for truncate: %s", remote_path);
-    }
+  if (!handle) {
+    throw IOException("Failed to open file for truncate: %s", remote_path);
+  }
 
-    // Set file size using fsetstat
-    LIBSSH2_SFTP_ATTRIBUTES attrs;
-    memset(&attrs, 0, sizeof(attrs));
-    attrs.filesize = new_size;
-    attrs.flags = LIBSSH2_SFTP_ATTR_SIZE;
+  // Set file size using fsetstat
+  LIBSSH2_SFTP_ATTRIBUTES attrs;
+  memset(&attrs, 0, sizeof(attrs));
+  attrs.filesize = new_size;
+  attrs.flags = LIBSSH2_SFTP_ATTR_SIZE;
 
-    int rc = libssh2_sftp_fsetstat(handle, &attrs);
-    libssh2_sftp_close(handle);
-    ReturnSFTPSession(sftp);
+  int rc = libssh2_sftp_fsetstat(handle, &attrs);
+  libssh2_sftp_close(handle);
 
-    if (rc != 0) {
-      throw IOException("Failed to truncate file: %s to size %lld", remote_path,
-                        new_size);
-    }
-  } catch (...) {
-    ReturnSFTPSession(sftp);
-    throw;
+  if (rc != 0) {
+    throw IOException("Failed to truncate file: %s to size %lld", remote_path,
+                      new_size);
   }
 }
 
@@ -1286,14 +1251,12 @@ size_t SSHClient::ReadBytesSFTP(const std::string &remote_path, char *buffer,
   // This allows multiple file handles to share a small pool of sessions
   SSHFS_LOG("  [READ-SFTP] Borrowing SFTP session from pool for " << remote_path
                                                                   << "...");
-  LIBSSH2_SFTP *sftp = BorrowSFTPSession();
+  // The lease holds the session lock until this function returns
+  SFTPLease lease(*this);
+  LIBSSH2_SFTP *sftp = lease.Get();
   SSHFS_LOG("  [READ-SFTP] Session borrowed, opening file...");
 
-  // Serialize SFTP operations - libssh2 SFTP sessions are NOT thread-safe
-  // Multiple threads cannot use the same session concurrently
-  std::lock_guard<std::mutex> lock(upload_mutex);
-
-  try {
+  {
     // Open file for reading
     auto open_start = std::chrono::steady_clock::now();
     SSHFS_LOG("  [READ-SFTP] Opening " << remote_path << " for read...");
@@ -1369,7 +1332,6 @@ size_t SSHClient::ReadBytesSFTP(const std::string &remote_path, char *buffer,
     // Close handle and return session to pool
     auto close_start = std::chrono::steady_clock::now();
     libssh2_sftp_close(handle);
-    ReturnSFTPSession(sftp); // Return to pool for reuse
     auto close_end = std::chrono::steady_clock::now();
     auto close_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         close_end - close_start)
@@ -1390,10 +1352,6 @@ size_t SSHClient::ReadBytesSFTP(const std::string &remote_path, char *buffer,
                                       << "ms, close=" << close_ms << "ms");
 
     return total_read;
-  } catch (...) {
-    // Return session to pool on error - critical to avoid leaking sessions!
-    ReturnSFTPSession(sftp);
-    throw;
   }
 }
 

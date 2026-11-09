@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include <atomic>
 #include <condition_variable>
 #include <libssh2.h>
 #include <libssh2_sftp.h>
@@ -49,8 +50,9 @@ public:
   void Connect();
   void Disconnect();
   bool IsConnected() const { return connected; }
+  // Keepalive check. Returns true without probing if another thread is
+  // currently using the session (it is demonstrably in use).
   bool ValidateConnection();
-  LIBSSH2_SESSION *GetSession() const { return session; }
 
   // Capability detection
   bool SupportsCommands() const { return supports_commands; }
@@ -71,9 +73,24 @@ public:
   size_t ReadBytes(const std::string &remote_path, char *buffer, size_t offset,
                    size_t length);
 
-  // SFTP session pooling for efficient uploads
-  LIBSSH2_SFTP *BorrowSFTPSession();
-  void ReturnSFTPSession(LIBSSH2_SFTP *sftp);
+  // RAII lease on the session lock plus the pooled SFTP channel. Holds the
+  // session lock (connecting first if needed) until destroyed, so every libssh2
+  // call made through Get() is serialized with all other calls on the session.
+  class SFTPLease {
+  public:
+    explicit SFTPLease(SSHClient &client)
+        : client(client), lock(client.LockConnected()),
+          sftp(client.BorrowSFTPSession()) {}
+    ~SFTPLease() { client.ReturnSFTPSession(sftp); }
+    SFTPLease(const SFTPLease &) = delete;
+    SFTPLease &operator=(const SFTPLease &) = delete;
+    LIBSSH2_SFTP *Get() const { return sftp; }
+
+  private:
+    SSHClient &client;
+    std::unique_lock<std::recursive_mutex> lock;
+    LIBSSH2_SFTP *sftp;
+  };
 
   // SFTP-only operations (no SSH command execution)
   void CreateDirectorySFTP(const std::string &remote_path);
@@ -86,24 +103,41 @@ private:
   SSHConnectionParams params;
   int sock = -1;
   LIBSSH2_SESSION *session = nullptr;
-  bool connected = false;
+  std::atomic<bool> connected{false};
   bool supports_commands = false; // Auto-detected: can execute SSH commands
   bool dd_disabled =
       false;               // Disabled after channel failures (use SFTP instead)
-  std::mutex upload_mutex; // Protect concurrent SFTP operations
 
-  // SFTP session pool
+  // libssh2 sessions are not thread-safe: every libssh2 call on `session` (or
+  // on anything derived from it: SFTP channels, handles, exec channels) must
+  // happen while holding this lock. Recursive so public operations can nest.
+  // Lock order: session_mutex before pool_mutex.
+  std::recursive_mutex session_mutex;
+
+  // SFTP session pool (guarded by pool_mutex; used only under session_mutex)
   std::queue<LIBSSH2_SFTP *> sftp_pool;
   std::mutex pool_mutex;
   std::condition_variable pool_cv;
   size_t pool_size = 1; // Single SFTP session - reused across reads
   bool pool_initialized = false;
 
+  std::unique_lock<std::recursive_mutex> LockSession() {
+    return std::unique_lock<std::recursive_mutex>(session_mutex);
+  }
+  // Take the session lock and (re)connect if the session is down.
+  std::unique_lock<std::recursive_mutex> LockConnected();
+  LIBSSH2_SFTP *BorrowSFTPSession();
+  void ReturnSFTPSession(LIBSSH2_SFTP *sftp);
+
   void InitializeSession();
   void Authenticate();
   void CleanupSession();
+  // Requires pool_mutex held
   void InitializeSFTPPool();
+  // Takes pool_mutex
   void CleanupSFTPPool();
+  // Requires pool_mutex held
+  void CleanupSFTPPoolLocked();
 };
 
 } // namespace duckdb

@@ -438,6 +438,8 @@ SSHConnectionParams SSHFSFileSystem::ParseURL(const string &path,
     if (FileOpener::TryGetCurrentSetting(opener, "sshfs_debug_logging",
                                          value)) {
       params.debug_logging = value.GetValue<bool>();
+      // Process-wide so it applies on every thread (see ssh_helpers.hpp)
+      g_sshfs_debug_enabled.store(params.debug_logging);
     }
 
     if (FileOpener::TryGetCurrentSetting(opener, "sshfs_timeout_seconds",
@@ -508,13 +510,29 @@ SSHFSFileSystem::GetOrCreateClient(const string &path, FileOpener *opener) {
   auto params = ParseURL(path, opener);
   string connection_key = ExtractConnectionKey(params);
 
-  std::lock_guard<std::mutex> lock(pool_mutex);
+  // Look up under the pool lock, but validate outside it: validation takes the
+  // client's session lock and must not block lookups for other hosts.
+  std::shared_ptr<SSHClient> existing;
+  {
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    auto it = client_pool.find(connection_key);
+    if (it != client_pool.end()) {
+      existing = it->second;
+    }
+  }
 
-  // Check if client already exists
+  // A client that is not connected yet (or was disconnected for a retry) is
+  // reconnected by its callers; only replace one whose keepalive failed.
+  if (existing &&
+      (!existing->IsConnected() || existing->ValidateConnection())) {
+    return existing;
+  }
+
+  std::lock_guard<std::mutex> lock(pool_mutex);
   auto it = client_pool.find(connection_key);
   if (it != client_pool.end()) {
-    // Validate the pooled connection is still alive
-    if (it->second->ValidateConnection()) {
+    if (it->second != existing) {
+      // Another thread already replaced or created it
       return it->second;
     }
     // Connection is dead, remove it from pool and create new one
