@@ -5,6 +5,27 @@ set(TARGET_NAME sshfs)
 
 project(${TARGET_NAME})
 
+# Patch DuckDB's vendored sources at configure time (the extension template has no hook for this).
+# Idempotent: a patch that is already applied (reverse applies cleanly) is skipped.
+file(GLOB DUCKDB_PATCHES ${CMAKE_CURRENT_LIST_DIR}/patches/duckdb/*.patch)
+list(SORT DUCKDB_PATCHES)
+foreach(DUCKDB_PATCH ${DUCKDB_PATCHES})
+  execute_process(
+    COMMAND git apply --reverse --check ${DUCKDB_PATCH}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    RESULT_VARIABLE DUCKDB_PATCH_APPLIED
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT DUCKDB_PATCH_APPLIED EQUAL 0)
+    execute_process(
+      COMMAND git apply ${DUCKDB_PATCH}
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      RESULT_VARIABLE DUCKDB_PATCH_RESULT)
+    if(NOT DUCKDB_PATCH_RESULT EQUAL 0)
+      message(FATAL_ERROR "Failed to apply ${DUCKDB_PATCH} to DuckDB")
+    endif()
+  endif()
+endforeach()
+
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package.
 if(CLANG_TIDY)

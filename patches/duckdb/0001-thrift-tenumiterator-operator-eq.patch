@@ -1,0 +1,17 @@
+Backport of duckdb/duckdb#21135 (merge commit 9ed595b0) to v1.4.4: add TEnumIterator::operator==.
+Newer libc++ compares the std::map range-constructor iterators with ==.
+
+diff --git a/third_party/thrift/thrift/Thrift.h b/third_party/thrift/thrift/Thrift.h
+index e9315f7..1b56c05 100755
+--- a/third_party/thrift/thrift/Thrift.h
++++ b/third_party/thrift/thrift/Thrift.h
+@@ -69,6 +69,9 @@ public:
+     assert(end.n_ == -1);
+     return (ii_ != n_);
+   }
++  bool operator==(const TEnumIterator& end) {
++    return !(*this != end);
++  }
+ 
+   std::pair<int, const char*> operator*() const { return std::make_pair(enums_[ii_], names_[ii_]); }
+ 
